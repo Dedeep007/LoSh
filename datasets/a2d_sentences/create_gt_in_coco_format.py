@@ -14,10 +14,24 @@ from tqdm import tqdm
 from pycocotools.mask import encode, area
 from datasets.a2d_sentences import a2d_sentences_dataset
 
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk import pos_tag
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger_eng')
+nltk.download('punkt_tab')
+nltk.download('tagsets')
+
 subset_type = 'test'
 dataset_path = './a2d_sentences'
 output_path = f'./datasets/a2d_sentences/a2d_sentences_{subset_type}_annotations_in_coco_format.json'
 
+def generate_short_text_query(query):
+        words = word_tokenize(query) 
+        pos_tags = pos_tag(words)  
+        verb_index = next((i for i, (_, tag) in enumerate(pos_tags) if tag.startswith('VB')), len(pos_tags))
+        short_text = " ".join(words[:verb_index])
+        return short_text
 
 def get_text_annotations(root_path, subset):
     # without 'header == None' pandas will ignore the first sample...
@@ -36,7 +50,11 @@ def get_text_annotations(root_path, subset):
     used_text_annotations = text_annotations[text_annotations.video_id.isin(used_videos_ids)]
     # convert data-frame to list of tuples:
     # (video_id, instance_id, query, short_query) without index name (str, int ,str)
-    used_text_annotations = list(used_text_annotations.to_records(index=False))
+    used_text_annotations = used_text_annotations[used_text_annotations['instance_id'] != '1 (copy)']
+    used_text_annotations = [
+        (row['video_id'], row['instance_id'], row['query'], generate_short_text_query(row['query']))
+        for row in used_text_annotations.to_records(index=False)
+    ]
     return used_text_annotations
 
 
@@ -53,10 +71,14 @@ def create_a2d_sentences_ground_truth_test_annotations():
     annotations_dict = []
     images_set = set()
     instance_id_counter = 1
+    print("text_annotations",text_annotations[0])
+    print("hello")
     for annot in tqdm(text_annotations):
         video_id, instance_id, text_query, short_text_query = annot
+        print("annot: ",annot)
         # iterate and sort all the h5py GT labels for specific videos via video_id
         annot_paths = sorted(glob(path.join(mask_annotations_dir, video_id, '*.h5')))
+        print("annot_paths: ",annot_paths)
         for p in annot_paths:
             f = h5py.File(p)
             instances = list(f['instance'])
@@ -69,8 +91,12 @@ def create_a2d_sentences_ground_truth_test_annotations():
                 continue  # instance_id does not appear in current frame
             mask = f['reMask'][instance_idx] if len(instances) > 1 else np.array(f['reMask'])
             mask = mask.transpose()
-
-            frame_idx = int(p.split('/')[-1].split('.')[0])
+            print("P value",p )
+      
+            print(p.split('/')[-1].split('.')[0][-5:])
+        
+            frame_idx = int(p.split('/')[-1].split('.')[0][-5:])
+            
             image_id = a2d_sentences_dataset.get_image_id(video_id, frame_idx, instance_id)
             assert image_id not in images_set, f'error: image id: {image_id} appeared twice'
             images_set.add(image_id)

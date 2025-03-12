@@ -22,6 +22,13 @@ from pycocotools.mask import encode, area
 from misc import nested_tensor_from_videos_list
 from datasets.a2d_sentences.create_gt_in_coco_format import create_a2d_sentences_ground_truth_test_annotations
 
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk import pos_tag
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger_eng')
+nltk.download('punkt_tab')
+nltk.download('tagsets')
 
 def get_image_id(video_id, frame_idx, ref_instance_a2d_id):
     image_id = f'v_{video_id}_f_{frame_idx}_i_{ref_instance_a2d_id}'
@@ -51,6 +58,14 @@ class A2DSentencesDataset(Dataset):
             if distributed:
                 dist.barrier()
 
+    @staticmethod
+    def generate_short_text_query(query):
+        words = word_tokenize(query) 
+        pos_tags = pos_tag(words)  
+        verb_index = next((i for i, (_, tag) in enumerate(pos_tags) if tag.startswith('VB')), len(pos_tags))
+        short_text = " ".join(words[:verb_index])
+        return short_text
+    
     @staticmethod
     def get_text_annotations(root_path, subset, distributed):
         saved_annotations_file_path = f'./datasets/a2d_sentences/a2d_sentences_single_frame_{subset}_annotations.json'
@@ -84,29 +99,18 @@ class A2DSentencesDataset(Dataset):
             # the aim of the code below is to get the frame_id for each h5 text annotations
             text_annotations_by_frame = []
             mask_annotations_dir = path.join(root_path, 'text_annotations/a2d_annotation_with_instances')
-            for video_id, instance_id, text_query, short_text_query in tqdm(used_text_annotations):
-                # glob and sort all the h5py file in specific video directory
-                # in this case, the h5py files for each video will be opened several times
+            #print(used_text_annotations)
+            for video_id, instance_id, query in tqdm(used_text_annotations):
                 frame_annot_paths = sorted(glob(path.join(mask_annotations_dir, video_id, '*.h5')))
-                instance_id = int(instance_id)
-                # for each f5py file in specific video directory:
+                short_text_query = A2DSentencesDataset.generate_short_text_query(query)
                 for p in frame_annot_paths:
                     f = h5py.File(p)
                     instances = list(f['instance'])
-                    #print(instances)
-                    #print(f['reMask'].shape)
-                    #re_masks = list(f['reMask'])
-                    # if the referred instance appears in this frame:
                     if instance_id in instances:
-
-                        # in case this instance does not appear in this frame it has no ground-truth mask, and thus this
-                        # frame-instance pair is ignored in evaluation, same as SOTA method: CMPC-V. check out:
-                        # https://github.com/spyflying/CMPC-Refseg/blob/094639b8bf00cc169ea7b49cdf9c87fdfc70d963/CMPC_video/build_A2D_batches.py#L98
                         frame_idx = int(p.split(os.sep)[-1].split('.')[0])
-                        # lower the text query prior to augmentation & tokenization
-                        text_query = text_query.lower()
-                        short_text_query = short_text_query.lower() 
-                        text_annotations_by_frame.append((text_query, short_text_query, video_id, frame_idx, instance_id))
+                        query = query.lower()
+                        short_text_query = short_text_query.lower()
+                        text_annotations_by_frame.append((query, short_text_query, video_id, frame_idx, instance_id))
             with open(saved_annotations_file_path, 'w') as f:
                 json.dump(text_annotations_by_frame, f)
         if distributed:
