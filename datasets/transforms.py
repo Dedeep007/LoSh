@@ -8,6 +8,14 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as F
 from misc import interpolate
 
+def box_xyxy_to_cxcywh(boxes):
+    x_min, y_min, x_max, y_max = boxes.unbind(1)
+    cx = (x_min + x_max) / 2
+    cy = (y_min + y_max) / 2
+    w = x_max - x_min
+    h = y_max - y_min
+    return torch.stack((cx, cy, w, h), dim=1)
+
 
 def crop(image, target, region):
     cropped_image = F.crop(image, *region)
