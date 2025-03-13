@@ -47,7 +47,8 @@ class A2DSentencesDataset(Dataset):
         self.subset_type = subset_type
         self.mask_annotations_dir = path.join(dataset_path, 'text_annotations/a2d_annotation_with_instances')
         self.videos_dir = path.join(dataset_path, 'Release/clips320H')
-        self.text_annotations = self.get_text_annotations(dataset_path, subset_type, distributed)
+        self.text_annotations = A2DSentencesDataset.get_text_annotations(dataset_path, subset_type, distributed)
+        #print("Text Annotations",self.text_annotations)
         self.window_size = window_size
         self.transforms = A2dSentencesTransforms(subset_type, **kwargs)
         self.collator = Collator()
@@ -58,6 +59,7 @@ class A2DSentencesDataset(Dataset):
             if distributed:
                 dist.barrier()
 
+    #Changes made by Dedeep.v.: Added a function to generate short text query
     @staticmethod
     def generate_short_text_query(query):
         words = word_tokenize(query) 
@@ -66,14 +68,16 @@ class A2DSentencesDataset(Dataset):
         short_text = " ".join(words[:verb_index])
         return short_text
     
+    #Changes made by Dedeep.v.: Implemented the generate short text query function in this function
     @staticmethod
     def get_text_annotations(root_path, subset, distributed):
         saved_annotations_file_path = f'./datasets/a2d_sentences/a2d_sentences_single_frame_{subset}_annotations.json'
-        if path.exists(saved_annotations_file_path):
-            with open(saved_annotations_file_path, 'r') as f:
-                text_annotations_by_frame = [tuple(a) for a in json.load(f)]
-                return text_annotations_by_frame
-        elif (distributed and dist.get_rank() == 0) or not distributed:
+        # if path.exists(saved_annotations_file_path):
+        #     with open(saved_annotations_file_path, 'r') as f:
+        #         print("in first if")
+        #         text_annotations_by_frame = [tuple(a) for a in json.load(f)]
+        #         return text_annotations_by_frame
+        if (distributed and dist.get_rank() == 0) or not distributed:
             print(f'building a2d sentences {subset} text annotations...')
             # without 'header == None' pandas will ignore the first sample...
             a2d_data_info = pandas.read_csv(path.join(root_path, 'Release/videoset.csv'), header=None)
@@ -102,17 +106,23 @@ class A2DSentencesDataset(Dataset):
             #print(used_text_annotations)
             for video_id, instance_id, query in tqdm(used_text_annotations):
                 frame_annot_paths = sorted(glob(path.join(mask_annotations_dir, video_id, '*.h5')))
-                short_text_query = A2DSentencesDataset.generate_short_text_query(query)
+                short_text_query = A2DSentencesDataset.generate_short_text_query(query)#Changes made by Dedeep.v.: Added a function to generate short text query
                 for p in frame_annot_paths:
+                    #print("in p for",p)
                     f = h5py.File(p)
                     instances = list(f['instance'])
-                    if instance_id in instances:
+                    #print("Instances",instances)
+                    #print(instance_id in instances)
+                    if (np.int64(instance_id) in instances):#Changes made by Dedeep.v.: converted instance_id to int64
                         frame_idx = int(p.split(os.sep)[-1].split('.')[0])
-                        query = query.lower()
+                        #print("Query",query)
                         short_text_query = short_text_query.lower()
+                        #print("Short Text Query",short_text_query)
                         text_annotations_by_frame.append((query, short_text_query, video_id, frame_idx, instance_id))
             with open(saved_annotations_file_path, 'w') as f:
                 json.dump(text_annotations_by_frame, f)
+            #print("text_annotations_by_frame",text_annotations_by_frame)    
+            return text_annotations_by_frame
         if distributed:
             dist.barrier()
             with open(saved_annotations_file_path, 'r') as f:
@@ -123,10 +133,13 @@ class A2DSentencesDataset(Dataset):
         text_query, short_text_query, video_id, frame_idx, instance_id = self.text_annotations[idx]
 
         text_query = " ".join(text_query.lower().split())  # clean up the text query
+        #print("Text Query",text_query)
         short_text_query = " ".join(short_text_query.lower().split())
+        #print("Short Text Query",short_text_query)
 
         # read the source window frames:
         video_frames, _, _ = read_video(path.join(self.videos_dir, f'{video_id}.mp4'), pts_unit='sec')  # (T, H, W, C)
+        #print("Video_frame_list: ", video_frames)
         # get a window of window_size frames with frame frame_idx in the middle.
         # note that the original a2d dataset is 1 indexed, so we have to subtract 1 from frame_idx
         start_idx, end_idx = frame_idx - 1 - self.window_size // 2, frame_idx - 1 + (self.window_size + 1) // 2
@@ -141,16 +154,22 @@ class A2DSentencesDataset(Dataset):
         frame_annot_path = path.join(self.mask_annotations_dir, video_id, f'{frame_idx:05d}.h5')
         f = h5py.File(frame_annot_path, 'r')
         instances = list(f['instance'])
-        instance_idx = instances.index(instance_id)  # existence was already validated during init
+        print("Instances",instances)
+        print("Instance element type",type(instances[0]))
+        print("Instance_id",instance_id)
+        print("type of instance_id",type(instance_id))
+        #Changes made by Dedeep.v.: converted instance_id to int64
+        instance_idx = instances.index(np.int64(instance_id))  # existence was already validated during init
+        print("Instance_idx",instance_idx)
 
-        instance_masks = np.array(f['reMask'])
+        instance_masks = np.array(f['reMask'], dtype=np.uint8)
         if len(instances) == 1:
             instance_masks = instance_masks[np.newaxis, ...]
         # (num_instance, W, H) -> (num_instance, H, W)
         instance_masks = torch.tensor(instance_masks).transpose(1, 2)
         #print(len(instances), " ",instance_idx, " ",instance_masks.shape)
         mask_rles = [encode(mask) for mask in instance_masks.numpy()]
-        mask_areas = area(mask_rles).astype(np.float)
+        mask_areas = area(mask_rles).astype(float)#Changes made by Dedeep.v.: edited astype(np.float) to astype(float) 
         f.close()
 
         # create the target dict for the center frame:

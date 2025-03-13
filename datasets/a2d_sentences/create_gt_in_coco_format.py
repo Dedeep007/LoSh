@@ -26,6 +26,7 @@ subset_type = 'test'
 dataset_path = './a2d_sentences'
 output_path = f'./datasets/a2d_sentences/a2d_sentences_{subset_type}_annotations_in_coco_format.json'
 
+#Changes made by Dedeep.v.: Added a function to generate short text query
 def generate_short_text_query(query):
         words = word_tokenize(query) 
         pos_tags = pos_tag(words)  
@@ -92,9 +93,9 @@ def create_a2d_sentences_ground_truth_test_annotations():
             mask = f['reMask'][instance_idx] if len(instances) > 1 else np.array(f['reMask'])
             mask = mask.transpose()
             print("P value",p )
-      
+
             print(p.split('/')[-1].split('.')[0][-5:])
-        
+            #Changes made here: frame_idx = int(p.split('/')[-1].split('.')[0]) to frame_idx = int(p.split('/')[-1].split('.')[0][-5:]) by Dedeep.v.
             frame_idx = int(p.split('/')[-1].split('.')[0][-5:])
             
             image_id = a2d_sentences_dataset.get_image_id(video_id, frame_idx, instance_id)
