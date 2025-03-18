@@ -14,6 +14,20 @@ from einops import rearrange
 import datasets.transforms as T
 from misc import nested_tensor_from_videos_list
 
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk import pos_tag
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger_eng')
+nltk.download('punkt_tab')
+nltk.download('tagsets') #Changed by Dedeep.v. to added imports for short text query retrieval
+
+def generate_short_text_query(query):#Changed by Dedeep.v. to added function for short text query retrieval
+        words = word_tokenize(query) 
+        pos_tags = pos_tag(words)  
+        verb_index = next((i for i, (_, tag) in enumerate(pos_tags) if tag.startswith('VB')), len(pos_tags))
+        short_text = " ".join(words[:verb_index])
+        return short_text
 
 class ReferYouTubeVOSDataset(Dataset):
     """
@@ -62,7 +76,8 @@ class ReferYouTubeVOSDataset(Dataset):
             with open(metadata_file_path, 'r') as f:
                 samples_list = [tuple(a) for a in tqdm(json.load(f), disable=distributed and dist.get_rank() != 0)]
                 return samples_list
-        elif (distributed and dist.get_rank() == 0) or not distributed:
+        print("Distributed",distributed) 
+        if (distributed and dist.get_rank() == 0) or not distributed:
             print(f'creating {subset_type} subset samples metadata...')
             subset_expressions_file_path = path.join(dataset_path, 'meta_expressions', subset_type, 'meta_expressions.json')
             with open(subset_expressions_file_path, 'r') as f:
@@ -70,7 +85,7 @@ class ReferYouTubeVOSDataset(Dataset):
 
             if subset_type == 'train':
                 # generate video samples in parallel (this is required in 'train' mode to avoid long processing times):
-                vid_extra_params = (window_size, subset_type, self.mask_annotations_dir, self.device)
+                vid_extra_params = (window_size, subset_type, self.mask_annotations_dir)
                 params_by_vid = [(vid_id, vid_data, *vid_extra_params) for vid_id, vid_data in subset_expressions_by_video.items()]
                 n_jobs = min(multiprocessing.cpu_count(), 12)
                 samples_lists = Parallel(n_jobs)(delayed(self.generate_train_video_samples)(*p) for p in tqdm(params_by_vid))
@@ -93,7 +108,9 @@ class ReferYouTubeVOSDataset(Dataset):
                     vid_frames_indices = sorted(data['frames'])
                     for exp_id, exp_dict in data['expressions'].items():
                         exp_dict['exp_id'] = exp_id
-                        samples_list.append((vid_id, vid_frames_indices, exp_dict))
+                        short_text_query = generate_short_text_query(exp_dict['exp'])  # Generate short text query#Changed by Dedeep.v. to added short text query
+                        exp_dict['short_text_query'] = short_text_query  # Store short text query
+                        samples_list.append((vid_id, vid_frames_indices, exp_dict, short_text_query))  # Include short_text_query
 
             with open(metadata_file_path, 'w') as f:
                 json.dump(samples_list, f)
@@ -104,7 +121,7 @@ class ReferYouTubeVOSDataset(Dataset):
         return samples_list
 
     @staticmethod
-    def generate_train_video_samples(vid_id, vid_data, window_size, subset_type, mask_annotations_dir, device):
+    def generate_train_video_samples(vid_id, vid_data, window_size, subset_type, mask_annotations_dir):
         vid_frames = sorted(vid_data['frames'])
         vid_windows = [vid_frames[i:i + window_size] for i in range(0, len(vid_frames), window_size)]
         # replace last window with a full window if it is too short:
@@ -118,19 +135,21 @@ class ReferYouTubeVOSDataset(Dataset):
         samples_list = []
         for exp_id, exp_dict in vid_data['expressions'].items():
             exp_dict['exp_id'] = exp_id
+            short_text_query = generate_short_text_query(exp_dict['exp'])  # Generate short text query#Changed by Dedeep.v. to added short text query
+            exp_dict['short_text_query'] = short_text_query  # Store short text query 
             for window in vid_windows:
                 if subset_type == 'train':
                     # if train subset, make sure that the referred object appears in the window, else skip:
                     annotation_paths = [path.join(mask_annotations_dir, vid_id, f'{idx}.png') for idx in window]
-                    mask_annotations = [torch.tensor(np.array(Image.open(p)), device=device) for p in annotation_paths]
+                    mask_annotations = [torch.tensor(np.array(Image.open(p))) for p in annotation_paths]
                     all_object_indices = set().union(*[m.unique().tolist() for m in mask_annotations])
                     if int(exp_dict['obj_id']) not in all_object_indices:
                         continue
-                samples_list.append((vid_id, window, exp_dict))
+                samples_list.append((vid_id, window, exp_dict, short_text_query))  # Include short_text_query
         return samples_list
 
     def __getitem__(self, idx):
-        video_id, frame_indices, text_query_dict = self.samples_list[idx]
+        video_id, frame_indices, text_query_dict, short_text_query = self.samples_list[idx]  # Changes made by Dedeep.v.: added short text query
         text_query = text_query_dict['exp']
         text_query = " ".join(text_query.lower().split())  # clean up the text query
 
@@ -160,15 +179,15 @@ class ReferYouTubeVOSDataset(Dataset):
             targets = []
             for frame_masks in mask_annotations_by_frame:
                 target = {'masks': frame_masks,
-                          # idx in 'masks' of the text referred instance
-                          'referred_instance_idx': ref_obj_idx,
-                          # whether the referred instance is visible in the frame:
-                          'is_ref_inst_visible': frame_masks[ref_obj_idx].any(),
-                          'orig_size': frame_masks.shape[-2:],  # original frame shape without any augmentations
-                          # size with augmentations, will be changed inside transforms if necessary
-                          'size': frame_masks.shape[-2:],
-                          'iscrowd': torch.zeros(len(frame_masks)),  # for compatibility with DETR COCO transforms
-                          }
+                        # idx in 'masks' of the text referred instance
+                        'referred_instance_idx': ref_obj_idx,
+                        # whether the referred instance is visible in the frame:
+                        'is_ref_inst_visible': frame_masks[ref_obj_idx].any(),
+                        'orig_size': frame_masks.shape[-2:],  # original frame shape without any augmentations
+                        # size with augmentations, will be changed inside transforms if necessary
+                        'size': frame_masks.shape[-2:],
+                        'iscrowd': torch.zeros(len(frame_masks)),  # for compatibility with DETR COCO transforms
+                        }
                 targets.append(target)
         else:
             # validation subset has no annotations, so create dummy targets:
@@ -177,18 +196,17 @@ class ReferYouTubeVOSDataset(Dataset):
         source_frames, targets, text_query = self.transforms(source_frames, targets, text_query)
 
         if self.subset_type == 'train':
-            return source_frames, targets, text_query
+            return source_frames, targets, text_query, short_text_query  # Include short_text_query
         else:  # validation:
             video_metadata = {'video_id': video_id,
-                              'frame_indices': frame_indices,
-                              'resized_frame_size': source_frames.shape[-2:],
-                              'original_frame_size': original_frame_size,
-                              'exp_id': text_query_dict['exp_id']}
-            return source_frames, video_metadata, text_query
+                            'frame_indices': frame_indices,
+                            'resized_frame_size': source_frames.shape[-2:],
+                            'original_frame_size': original_frame_size,
+                            'exp_id': text_query_dict['exp_id']}
+            return source_frames, video_metadata, text_query, short_text_query  # Include short_text_query
 
-    def __len__(self):
+    def __len__(self):#Changes made by Dedeep.v.: added len function
         return len(self.samples_list)
-
 
 class A2dSentencesTransforms:
     def __init__(self, subset_type, horizontal_flip_augmentations, resize_and_crop_augmentations,
@@ -223,22 +241,24 @@ class Collator:
 
     def __call__(self, batch):
         if self.subset_type == 'train':
-            samples, targets, text_queries = list(zip(*batch))
+            samples, targets, text_queries, short_text_queries = list(zip(*batch))
             samples = nested_tensor_from_videos_list(samples)  # [T, B, C, H, W]
             # convert targets to a list of tuples. outer list - time steps, inner tuples - time step batch
             targets = list(zip(*targets))
             batch_dict = {
                 'samples': samples,
                 'targets': targets,
-                'text_queries': text_queries
+                'text_queries': text_queries,
+                'short_text_queries': short_text_queries  # Include short_text_queries
             }
             return batch_dict
         else:  # validation:
-            samples, videos_metadata, text_queries = list(zip(*batch))
+            samples, videos_metadata, text_queries, short_text_queries = list(zip(*batch))
             samples = nested_tensor_from_videos_list(samples)  # [T, B, C, H, W]
             batch_dict = {
                 'samples': samples,
                 'videos_metadata': videos_metadata,
-                'text_queries': text_queries
+                'text_queries': text_queries,
+                'short_text_queries': short_text_queries  # Changes made by Dedeep.v.: added short text queries
             }
             return batch_dict
