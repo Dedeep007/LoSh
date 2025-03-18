@@ -38,6 +38,8 @@ class Trainer:
         self.is_main_process = process_id == 0
         self.device = init_process_group_and_set_device(num_processes, process_id, device_id, config)
 
+        torch.backends.cudnn.benchmark = True #Changes made by Dedeep.v. : to encounter the error of "RuntimeError: cuDNN error: CUDNN_STATUS_INTERNAL_ERROR"
+
         # fix the seed for reproducibility
         seed = config.seed + config.rank
         torch.manual_seed(seed)
@@ -118,7 +120,7 @@ class Trainer:
         self.best_mAP = 0
         self.best_loss = math.inf
 
-    def train(self):
+    def train(self):#Changes made by Dedeep.v. : added short queries arguments
         print("Training started...")
         for self.epoch in tqdm(range(self.epoch, self.total_epochs), disable=not self.is_main_process):
             self.model.train()
@@ -164,7 +166,7 @@ class Trainer:
 
                 if self.is_main_process:
                     wandb.log({'iteration': self.iteration, 'total_iteration_loss': total_loss_reduced,
-                               'main_model_learning_rate': self.optimizer.param_groups[0]['lr']})
+                            'main_model_learning_rate': self.optimizer.param_groups[0]['lr']})
                 self.iteration += 1
                 total_epoch_loss += total_loss_reduced
                 for k in loss_sums_dict.keys():
