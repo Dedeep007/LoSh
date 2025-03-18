@@ -81,6 +81,9 @@ set_cost_is_referred:
 set_cost_dice:
   desc: dice coefficient in the matching cost
   value: 5
+set_cost_conditioned_iou:
+  desc: contitioned iou on pred_long coefficient in the matching cost #Changes made by Dedeep.v. added args related to IOU loss
+  value: 0.8
 
 # * Loss coefficients
 is_referred_loss_coef:
@@ -92,6 +95,8 @@ dice_loss_coef:
 eos_coef:
   desc: Relative classification weight of the no-object class
   value: 0.1
+conditioned_iou_loss_coef: #Changes made by Dedeep.v. added args related to IOU loss
+  value: 0.8
 
 # * Dataset Parameters
 dataset_name:
