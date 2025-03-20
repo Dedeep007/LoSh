@@ -280,7 +280,8 @@ class Trainer:
             samples = batch_dict['samples'].to(self.device)
             valid_indices = torch.arange(len(samples.tensors)).to(self.device)
             text_queries = batch_dict['text_queries']
-            outputs = self.model(samples, valid_indices, text_queries)
+            short_text_queries = batch_dict['short_text_queries'] #Changes made by Dedeep.v. : added short queries arguments
+            outputs = self.model(samples, valid_indices, text_queries, short_text_queries) #Changes made by Dedeep.v. : added short queries arguments
             videos_metadata = batch_dict['videos_metadata']
             sample_shape_with_padding = samples.tensors.shape[-2:]
             preds_by_video = self.postprocessor(outputs, videos_metadata, sample_shape_with_padding)
