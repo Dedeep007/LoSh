@@ -67,6 +67,7 @@ refer_youtube_vos/
 a2d_sentences/
 jhmdb_sentences/
 runs/
+pretrained_swin_transformer/
 
 # Ignore all JSON files
 *.json
