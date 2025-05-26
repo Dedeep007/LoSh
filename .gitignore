@@ -1,0 +1,72 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+dist/
+*.egg-info/
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+debug.log
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# mypy
+.mypy_cache/
+.dmypy.json
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Logs
+*.log
+*.out
+*.err
+
+# Add refer_youtube, a2d_sentences, and jhmdb_sentences directories to .gitignore
+refer_youtube_vos/
+a2d_sentences/
+jhmdb_sentences/
+runs/
+
+# Ignore all JSON files
+*.json
