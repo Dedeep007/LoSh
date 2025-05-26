@@ -154,13 +154,13 @@ class A2DSentencesDataset(Dataset):
         frame_annot_path = path.join(self.mask_annotations_dir, video_id, f'{frame_idx:05d}.h5')
         f = h5py.File(frame_annot_path, 'r')
         instances = list(f['instance'])
-        print("Instances",instances)
-        print("Instance element type",type(instances[0]))
-        print("Instance_id",instance_id)
-        print("type of instance_id",type(instance_id))
+        # print("Instances",instances)
+        # print("Instance element type",type(instances[0]))
+        # print("Instance_id",instance_id)
+        # print("type of instance_id",type(instance_id))
         #Changes made by Dedeep.v.: converted instance_id to int64
         instance_idx = instances.index(np.int64(instance_id))  # existence was already validated during init
-        print("Instance_idx",instance_idx)
+        # print("Instance_idx",instance_idx)
 
         instance_masks = np.array(f['reMask'], dtype=np.uint8)
         if len(instances) == 1:

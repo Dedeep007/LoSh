@@ -70,5 +70,8 @@ refer_davis/
 runs/
 pretrained_swin_transformer/
 
-# Ignore all JSON files
-*.json
+# Ignore all JSON files in all directories
+**/*.json
+**/a2d_sentences_single_frame_test_annotations.json
+# Ignore specific JSON file
+LoSh/datasets/a2d_sentences/a2d_sentences_single_frame_test_annotations.json
