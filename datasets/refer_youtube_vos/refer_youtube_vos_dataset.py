@@ -1,113 +1,264 @@
 import json
-import h5py
 import torch
-
 from torch.utils.data import Dataset
-from torchvision.io import read_video
+import torch.distributed as dist
+import torchvision.transforms.functional as F
 from os import path
 from glob import glob
 from tqdm import tqdm
-from pycocotools.mask import encode, area
+from joblib import Parallel, delayed
+import multiprocessing
+from PIL import Image
+import numpy as np
+from einops import rearrange
+import datasets.transforms as T
 from misc import nested_tensor_from_videos_list
+
+import nltk
 from nltk.tokenize import word_tokenize
 from nltk import pos_tag
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger_eng')
+nltk.download('punkt_tab')
+nltk.download('tagsets') #Changed by Dedeep.v. to added imports for short text query retrieval
 
-class ReferDavisDataset(Dataset):
-    """
-    A Torch dataset for Refer-DAVIS.
-    """
-    def __init__(self, subset_type: str = 'train', dataset_path: str = './refer_davis', window_size=8, **kwargs):
-        super(ReferDavisDataset, self).__init__()
-        assert subset_type in ['train', 'test'], 'error, unsupported dataset subset type. supported: train, test'
-        self.subset_type = subset_type
-        self.mask_annotations_dir = path.join(dataset_path, 'davis_text_annotations')
-        self.videos_dir = path.join(dataset_path, 'DAVIS-2017-Unsupervised-trainval-480p')
-        self.text_annotations = self.get_text_annotations(dataset_path, subset_type)
-        self.window_size = window_size
-        self.transforms = None  # Add your transforms here if needed
-
-    @staticmethod
-    def get_text_annotations(root_path, subset):
-        """
-        Load text annotations for the given subset, dynamically handling all relevant files.
-        """
-        annotations_dir = path.join(root_path, 'davis_text_annotations')
-        annotations = []
-
-        for file_name in glob(path.join(annotations_dir, f'*{subset}*.txt')):
-            with open(file_name, 'r') as f:
-                for line in f:
-                    parts = line.strip().split(' ', 2)
-                    if len(parts) == 3:
-                        video_id, frame_idx, query = parts
-                        annotations.append((video_id, int(frame_idx), query.strip('"')))
-
-        if not annotations:
-            raise ValueError(f"No valid annotations found in {annotations_dir} for subset {subset}.")
-
-        return annotations
-
-    @staticmethod
-    def generate_short_text_query(query):
+def generate_short_text_query(query):#Changed by Dedeep.v. to added function for short text query retrieval
         words = word_tokenize(query) 
         pos_tags = pos_tag(words)  
         verb_index = next((i for i, (_, tag) in enumerate(pos_tags) if tag.startswith('VB')), len(pos_tags))
         short_text = " ".join(words[:verb_index])
         return short_text
 
-    def __getitem__(self, idx):
-        video_id, frame_idx, instance_id = self.text_annotations[idx]
+class ReferYouTubeVOSDataset(Dataset):
+    """
+    A dataset class for the Refer-Youtube-VOS dataset which was first introduced in the paper:
+    "URVOS: Unified Referring Video Object Segmentation Network with a Large-Scale Benchmark"
+    (see https://link.springer.com/content/pdf/10.1007/978-3-030-58555-6_13.pdf).
+    The original release of the dataset contained both 'first-frame' and 'full-video' expressions. However, the full
+    dataset is not publicly available anymore as now only the harder 'full-video' subset is available to download
+    through the Youtube-VOS referring video object segmentation competition page at:
+    https://competitions.codalab.org/competitions/29139
+    Furthermore, for the competition the subset's original validation set, which consists of 507 videos, was split into
+    two competition 'validation' & 'test' subsets, consisting of 202 and 305 videos respectively. Evaluation can
+    currently only be done on the competition 'validation' subset using the competition's server, as
+    annotations were publicly released only for the 'train' subset of the competition.
+    """
+    def __init__(self, subset_type: str = 'train', dataset_path: str = './refer_youtube_vos', window_size=12,
+                 distributed=False, device=None, **kwargs):
+        super(ReferYouTubeVOSDataset, self).__init__()
+        assert subset_type in ['train', 'test'], "error, unsupported dataset subset type. use 'train' or 'test'."
+        if subset_type == 'test':
+            subset_type = 'valid'  # Refer-Youtube-VOS is tested on its 'validation' subset (see description above)
+        self.subset_type = subset_type
+        self.window_size = window_size
+        num_videos_by_subset = {'train': 3471, 'valid': 202}
+        self.videos_dir = path.join(dataset_path, subset_type, 'JPEGImages')
+        assert len(glob(path.join(self.videos_dir, '*'))) == num_videos_by_subset[subset_type], \
+            f'error: {subset_type} subset is missing one or more frame samples'
+        if subset_type == 'train':
+            self.mask_annotations_dir = path.join(dataset_path, subset_type, 'Annotations')  # only available for train
+            assert len(glob(path.join(self.mask_annotations_dir, '*'))) == num_videos_by_subset[subset_type], \
+                f'error: {subset_type} subset is missing one or more mask annotations'
+        else:
+            self.mask_annotations_dir = None
+        self.device = device if device is not None else torch.device('cpu')
+        self.samples_list = self.generate_samples_metadata(dataset_path, subset_type, window_size, distributed)
+        self.transforms = A2dSentencesTransforms(subset_type, **kwargs)
+        self.collator = Collator(subset_type)
 
-        # Retrieve long and short queries
-        long_query = self.long_queries.get((video_id, frame_idx), "")
-        short_query = self.short_queries.get((video_id, frame_idx), "")
+    def generate_samples_metadata(self, dataset_path, subset_type, window_size, distributed):
+        if subset_type == 'train':
+            metadata_file_path = f'./datasets/refer_youtube_vos/train_samples_metadata_win_size_{window_size}.json'
+        else:  # validation
+            metadata_file_path = f'./datasets/refer_youtube_vos/valid_samples_metadata.json'
+        if path.exists(metadata_file_path):
+            print(f'loading {subset_type} subset samples metadata...')
+            with open(metadata_file_path, 'r') as f:
+                samples_list = [tuple(a) for a in tqdm(json.load(f), disable=distributed and dist.get_rank() != 0)]
+                return samples_list
+        print("Distributed",distributed) 
+        if (distributed and dist.get_rank() == 0) or not distributed:
+            print(f'creating {subset_type} subset samples metadata...')
+            subset_expressions_file_path = path.join(dataset_path, 'meta_expressions', subset_type, 'meta_expressions.json')
+            with open(subset_expressions_file_path, 'r') as f:
+                subset_expressions_by_video = json.load(f)['videos']
 
-        # Read video frames
-        video_frames, _, _ = read_video(path.join(self.videos_dir, f'{video_id}.mp4'), pts_unit='sec')
+            if subset_type == 'train':
+                # generate video samples in parallel (this is required in 'train' mode to avoid long processing times):
+                vid_extra_params = (window_size, subset_type, self.mask_annotations_dir)
+                params_by_vid = [(vid_id, vid_data, *vid_extra_params) for vid_id, vid_data in subset_expressions_by_video.items()]
+                n_jobs = min(multiprocessing.cpu_count(), 12)
+                samples_lists = Parallel(n_jobs)(delayed(self.generate_train_video_samples)(*p) for p in tqdm(params_by_vid))
+                samples_list = [s for l in samples_lists for s in l]  # flatten the jobs results lists
+            else:  # validation
+                # for some reasons the competition's validation expressions dict contains both the validation & test
+                # videos. so we simply load the test expressions dict and use it to filter out the test videos from
+                # the validation expressions dict:
+                test_expressions_file_path = path.join(dataset_path, 'meta_expressions', 'test', 'meta_expressions.json')
+                with open(test_expressions_file_path, 'r') as f:
+                    test_expressions_by_video = json.load(f)['videos']
+                test_videos = set(test_expressions_by_video.keys())
+                valid_plus_test_videos = set(subset_expressions_by_video.keys())
+                valid_videos = valid_plus_test_videos - test_videos
+                subset_expressions_by_video = {k: subset_expressions_by_video[k] for k in valid_videos}
+                assert len(subset_expressions_by_video) == 202, 'error: incorrect number of validation expressions'
 
-        # Get a window of frames
-        start_idx, end_idx = frame_idx - self.window_size // 2, frame_idx + self.window_size // 2
-        source_frames = [video_frames[min(max(i, 0), len(video_frames)-1)] for i in range(start_idx, end_idx)]
+                samples_list = []
+                for vid_id, data in tqdm(subset_expressions_by_video.items()):
+                    vid_frames_indices = sorted(data['frames'])
+                    for exp_id, exp_dict in data['expressions'].items():
+                        exp_dict['exp_id'] = exp_id
+                        short_text_query = generate_short_text_query(exp_dict['exp'])  # Generate short text query
+                        exp_dict['short_text_query'] = short_text_query  # Store short text query
+                        samples_list.append((vid_id, vid_frames_indices, exp_dict, short_text_query))  # Include short_text_query
 
-        # Read instance mask
-        frame_annot_path = path.join(self.mask_annotations_dir, video_id, f'{frame_idx:05d}.h5')
-        with h5py.File(frame_annot_path, 'r') as f:
-            instances = list(f['instance'])
-            instance_idx = instances.index(instance_id)
-            instance_masks = torch.tensor(f['reMask']).transpose(1, 2)
-
-        # Create target dict
-        target = {
-            'masks': instance_masks,
-            'orig_size': instance_masks.shape[-2:],
-            'size': instance_masks.shape[-2:],
-            'referred_instance_idx': torch.tensor(instance_idx),
-        }
-
-        return source_frames, target, long_query, short_query
-
-    def __len__(self):
-        return len(self.text_annotations)
+            with open(metadata_file_path, 'w') as f:
+                json.dump(samples_list, f)
+        if distributed:
+            dist.barrier()
+            with open(metadata_file_path, 'r') as f:
+                samples_list = [tuple(a) for a in tqdm(json.load(f), disable=distributed and dist.get_rank() != 0)]
+        return samples_list
 
     @staticmethod
-    def collator(batch):
-        """
-        Custom collator function to handle batching for ReferDavisDataset.
-        """
-        source_frames, targets, long_queries, short_queries = zip(*batch)
+    def generate_train_video_samples(vid_id, vid_data, window_size, subset_type, mask_annotations_dir):
+        vid_frames = sorted(vid_data['frames'])
+        vid_windows = [vid_frames[i:i + window_size] for i in range(0, len(vid_frames), window_size)]
+        # replace last window with a full window if it is too short:
+        if len(vid_windows[-1]) < window_size:
+            if len(vid_frames) >= window_size:  # there are enough frames to complete to a full window
+                vid_windows[-1] = vid_frames[-window_size:]
+            else:  # otherwise, just duplicate the last frame as necessary to complete to a full window
+                num_missing_frames = window_size - len(vid_windows[-1])
+                missing_frames = num_missing_frames * [vid_windows[-1][-1]]
+                vid_windows[-1] = vid_windows[-1] + missing_frames
+        samples_list = []
+        for exp_id, exp_dict in vid_data['expressions'].items():
+            exp_dict['exp_id'] = exp_id
+            short_text_query = generate_short_text_query(exp_dict['exp'])  # Generate short text query
+            exp_dict['short_text_query'] = short_text_query  # Store short text query 
+            for window in vid_windows:
+                if subset_type == 'train':
+                    # if train subset, make sure that the referred object appears in the window, else skip:
+                    annotation_paths = [path.join(mask_annotations_dir, vid_id, f'{idx}.png') for idx in window]
+                    mask_annotations = [torch.tensor(np.array(Image.open(p))) for p in annotation_paths]
+                    all_object_indices = set().union(*[m.unique().tolist() for m in mask_annotations])
+                    if int(exp_dict['obj_id']) not in all_object_indices:
+                        continue
+                samples_list.append((vid_id, window, exp_dict, short_text_query))  # Include short_text_query
+        return samples_list
 
-        # Stack frames and targets
-        batched_frames = nested_tensor_from_videos_list(source_frames)
-        batched_targets = [{
-            'masks': torch.stack([t['masks'] for t in targets]),
-            'orig_size': torch.stack([torch.tensor(t['orig_size']) for t in targets]),
-            'size': torch.stack([torch.tensor(t['size']) for t in targets]),
-            'referred_instance_idx': torch.stack([t['referred_instance_idx'] for t in targets]),
-        }]
+    def __getitem__(self, idx):
+        video_id, frame_indices, text_query_dict, short_text_query = self.samples_list[idx]  # Changes made by Dedeep.v.: added short text query
+        text_query = text_query_dict['exp']
+        text_query = " ".join(text_query.lower().split())  # clean up the text query
 
-        # Include scribbles if available
-        scribbles = [t.get('scribbles', None) for t in targets]
-        if any(scribbles):
-            batched_targets[0]['scribbles'] = scribbles
+        # read the source window frames:
+        frame_paths = [path.join(self.videos_dir, video_id, f'{idx}.jpg') for idx in frame_indices]
+        source_frames = [Image.open(p) for p in frame_paths]
+        original_frame_size = source_frames[0].size[::-1]
 
-        return batched_frames, batched_targets, list(long_queries), list(short_queries)
+        if self.subset_type == 'train':
+            # read the instance masks:
+            annotation_paths = [path.join(self.mask_annotations_dir, video_id, f'{idx}.png') for idx in frame_indices]
+            mask_annotations = [torch.tensor(np.array(Image.open(p))) for p in annotation_paths]
+            all_object_indices = set().union(*[m.unique().tolist() for m in mask_annotations])
+            all_object_indices.remove(0)  # remove the background index
+            all_object_indices = sorted(list(all_object_indices))
+            mask_annotations_by_object = []
+            for obj_id in all_object_indices:
+                obj_id_mask_annotations = torch.stack([(m == obj_id).to(torch.uint8) for m in mask_annotations])
+                mask_annotations_by_object.append(obj_id_mask_annotations)
+            mask_annotations_by_object = torch.stack(mask_annotations_by_object)
+            mask_annotations_by_frame = rearrange(mask_annotations_by_object, 'o t h w -> t o h w')  # o for object
+
+            # next we get the referred instance index in the list of all the object ids:
+            ref_obj_idx = torch.tensor(all_object_indices.index(int(text_query_dict['obj_id'])), dtype=torch.long)
+
+            # create a target dict for each frame:
+            targets = []
+            for frame_masks in mask_annotations_by_frame:
+                target = {'masks': frame_masks,
+                        # idx in 'masks' of the text referred instance
+                        'referred_instance_idx': ref_obj_idx,
+                        # whether the referred instance is visible in the frame:
+                        'is_ref_inst_visible': frame_masks[ref_obj_idx].any(),
+                        'orig_size': frame_masks.shape[-2:],  # original frame shape without any augmentations
+                        # size with augmentations, will be changed inside transforms if necessary
+                        'size': frame_masks.shape[-2:],
+                        'iscrowd': torch.zeros(len(frame_masks)),  # for compatibility with DETR COCO transforms
+                        }
+                targets.append(target)
+        else:
+            # validation subset has no annotations, so create dummy targets:
+            targets = len(source_frames) * [None]
+
+        source_frames, targets, text_query = self.transforms(source_frames, targets, text_query)
+
+        if self.subset_type == 'train':
+            return source_frames, targets, text_query, short_text_query  # Include short_text_query
+        else:  # validation:
+            video_metadata = {'video_id': video_id,
+                            'frame_indices': frame_indices,
+                            'resized_frame_size': source_frames.shape[-2:],
+                            'original_frame_size': original_frame_size,
+                            'exp_id': text_query_dict['exp_id']}
+            return source_frames, video_metadata, text_query, short_text_query  # Include short_text_query
+
+    def __len__(self):#Changes made by Dedeep.v.: added len function
+        return len(self.samples_list)
+
+class A2dSentencesTransforms:
+    def __init__(self, subset_type, horizontal_flip_augmentations, resize_and_crop_augmentations,
+                 train_short_size, train_max_size, eval_short_size, eval_max_size, **kwargs):
+        self.h_flip_augmentation = subset_type == 'train' and horizontal_flip_augmentations
+        normalize = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        scales = [train_short_size]  # size is slightly smaller than eval size below to fit in GPU memory
+        transforms = []
+        if resize_and_crop_augmentations:
+            if subset_type == 'train':
+                transforms.append(T.RandomResize(scales, max_size=train_max_size))
+            elif subset_type == 'valid':
+                transforms.append(T.RandomResize([eval_short_size], max_size=eval_max_size)),
+        transforms.extend([T.ToTensor(), normalize])
+        self.size_transforms = T.Compose(transforms)
+
+    def __call__(self, source_frames, targets, text_query):
+        if self.h_flip_augmentation and torch.rand(1) > 0.5:
+            source_frames = [F.hflip(f) for f in source_frames]
+            for t in targets:
+                t['masks'] = F.hflip(t['masks'])
+            # Note - is it possible for both 'right' and 'left' to appear together in the same query. hence this fix:
+            text_query = text_query.replace('left', '@').replace('right', 'left').replace('@', 'right')
+        source_frames, targets = list(zip(*[self.size_transforms(f, t) for f, t in zip(source_frames, targets)]))
+        source_frames = torch.stack(source_frames)  # [T, 3, H, W]
+        return source_frames, targets, text_query
+
+
+class Collator:
+    def __init__(self, subset_type):
+        self.subset_type = subset_type
+
+    def __call__(self, batch):
+        if self.subset_type == 'train':
+            samples, targets, text_queries, short_text_queries = list(zip(*batch))
+            samples = nested_tensor_from_videos_list(samples)  # [T, B, C, H, W]
+            # convert targets to a list of tuples. outer list - time steps, inner tuples - time step batch
+            targets = list(zip(*targets))
+            batch_dict = {
+                'samples': samples,
+                'targets': targets,
+                'text_queries': text_queries,
+                'short_text_queries': short_text_queries  # Include short_text_queries
+            }
+            return batch_dict
+        else:  # validation:
+            samples, videos_metadata, text_queries, short_text_queries = list(zip(*batch))
+            samples = nested_tensor_from_videos_list(samples)  # [T, B, C, H, W]
+            batch_dict = {
+                'samples': samples,
+                'videos_metadata': videos_metadata,
+                'text_queries': text_queries,
+                'short_text_queries': short_text_queries  # Changes made by Dedeep.v.: added short text queries
+            }
+            return batch_dict
